@@ -377,43 +377,43 @@ Start Menu entry in the "Day-to-day use" section (`README.md:131`) and adding
 Synthesized from this review's findings. Each task derives from a specific
 finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Guard the trailing `switch` so the script is dot-sourceable
+- [x] **T1 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Guard the trailing `switch` so the script is dot-sourceable
   - Surfaced by: Test review, Issue 6 — `:55` + `:501-508` run `Invoke-Status` on load, which shells to `npx`
   - Files: `ClaudeBG.ps1`
   - Verify: `. .\ClaudeBG.ps1` returns instantly and defines functions without printing status
-- [ ] **T2 (P1, human: ~45min / CC: ~8min)** — ClaudeBG.ps1 — Add `patched.json` marker; write in `Invoke-Patch`, delete it and both `.orig` in `Invoke-Restore`
+- [x] **T2 (P1, human: ~45min / CC: ~8min)** — ClaudeBG.ps1 — Add `patched.json` marker; write in `Invoke-Patch`, delete it and both `.orig` in `Invoke-Restore`
   - Surfaced by: Architecture, Issue 1 — `:463-473` restores backups but never deletes them
   - Files: `ClaudeBG.ps1`
   - Verify: `-Patch` then `-Restore`, then confirm marker and both `.orig` files are gone
-- [ ] **T3 (P2, human: ~20min / CC: ~4min)** — ClaudeBG.ps1 — Extract `Get-ClaudeDesktopProcess`, use it in all three call sites
+- [x] **T3 (P2, human: ~20min / CC: ~4min)** — ClaudeBG.ps1 — Extract `Get-ClaudeDesktopProcess`, use it in all three call sites
   - Surfaced by: Code quality, Issue 4 — filter duplicated at `:110`, `:112`, and again in the plan
   - Files: `ClaudeBG.ps1`
   - Verify: Pester case asserts `~\.local\bin\claude.exe` is never matched
-- [ ] **T4 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Add pure `Get-LaunchPlan` plus `-Launch` / `-NoHeal`
+- [x] **T4 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Add pure `Get-LaunchPlan` plus `-Launch` / `-NoHeal`
   - Surfaced by: Architecture, Issue 2 — Node throw aborts launch, double-launch race, silent second instance
   - Files: `ClaudeBG.ps1`
   - Verify: all five plan states return correctly with no Claude install present
-- [ ] **T5 (P2, human: ~20min / CC: ~4min)** — tools — Write `tools/make-icon.ps1`, generate and commit `ClaudeBG.ico`
+- [x] **T5 (P2, human: ~20min / CC: ~4min)** — tools — Write `tools/make-icon.ps1`, generate and commit `ClaudeBG.ico`
   - Surfaced by: TODO 1 — 3A commits a binary; nothing else in the repo can regenerate it
   - Files: `tools/make-icon.ps1`, `ClaudeBG.ico`
   - Verify: regenerating produces a byte-identical file; eyeball the 16px frame
-- [ ] **T6 (P2, human: ~40min / CC: ~8min)** — ClaudeBG.ps1 — Add `-InstallShortcut` / `-RemoveShortcut`; wire into `Invoke-Patch` and `Invoke-Restore`
+- [x] **T6 (P2, human: ~40min / CC: ~8min)** — ClaudeBG.ps1 — Add `-InstallShortcut` / `-RemoveShortcut`; wire into `Invoke-Patch` and `Invoke-Restore`
   - Surfaced by: Architecture, Issue 3 — no `IconLocation`; the exe carries its own icon
   - Files: `ClaudeBG.ps1`
   - Verify: Windows Search finds "ClaudeBG" (indexing can lag a few seconds on first write)
-- [ ] **T7 (P2, human: ~1h / CC: ~12min)** — tray — Rewire both startup paths; delete `MakeIcon` and the `DestroyIcon` P/Invoke
+- [x] **T7 (P2, human: ~1h / CC: ~12min)** — tray — Rewire both startup paths; delete `MakeIcon` and the `DestroyIcon` P/Invoke
   - Surfaced by: Architecture, Issues 2 and 3 — second instance uses `-NoHeal`; icon comes from the exe
   - Files: `tray/ClaudeBGTray.cs`
   - Verify: rebuild with `csc … /win32icon:ClaudeBG.ico`; launch twice, confirm no dialog and no second tray icon
-- [ ] **T8 (P2, human: ~50min / CC: ~10min)** — ClaudeBG.ps1 — Rework `-Status`: patch state, staleness, shortcut target compare, fuse probe behind `-Deep`
+- [x] **T8 (P2, human: ~50min / CC: ~10min)** — ClaudeBG.ps1 — Rework `-Status`: patch state, staleness, shortcut target compare, fuse probe behind `-Deep`
   - Surfaced by: Code quality Issue 5, Performance Issue 7, TODO 2
   - Files: `ClaudeBG.ps1`
   - Verify: plain `-Status` returns instantly with no Node on PATH
-- [ ] **T9 (P1, human: ~4h / CC: ~25min)** — tests — Pester suite `ClaudeBG.Tests.ps1`
+- [x] **T9 (P1, human: ~4h / CC: ~25min)** — tests — Pester suite `ClaudeBG.Tests.ps1`
   - Surfaced by: Test review, Issue 6 — 0/31 paths covered; two CRITICAL and silent
   - Files: `ClaudeBG.Tests.ps1`
   - Verify: `Invoke-Pester` green, including both CRITICAL cases
-- [ ] **T10 (P3, human: ~20min / CC: ~4min)** — docs — Update `README.md:131` (day-to-day use) and `:278` (file table)
+- [x] **T10 (P3, human: ~20min / CC: ~4min)** — docs — Update `README.md:131` (day-to-day use) and `:278` (file table)
   - Surfaced by: Distribution check — new artifacts and a new way to launch
   - Files: `README.md`
   - Verify: a fresh reader can install and reach the Start Menu entry from the README alone
@@ -440,6 +440,45 @@ T1 first because nothing is testable until it lands.
 - `tray/ClaudeBGTray.cs:7` says **"All the real work lives in ClaudeBG.ps1."** You
   wrote that boundary down a session ago, and it's what made Approach C the
   obvious answer today. Architecture notes you write to yourself pay out later.
+
+## Build Log
+
+Shipped in `a360891`. All ten tasks done, 40/40 Pester tests green. Three things
+differed from the plan, all found during implementation.
+
+**1. `Get-LaunchPlan` has six states, not five.** The plan had `WarnAndLaunch`
+covering "unpatched and not allowed to heal". But when Claude is *already
+running* in that state, launching is wrong — you would get a second window. Split
+out `WarnOnly`: warn, launch nothing. The `-ForEach` case in the suite asserts
+`NoHeal` never yields `Heal` across all four combinations of state and running.
+
+**2. Path-dependent functions took explicit parameters.** Not in the plan, and
+required. `Get-ActiveAppDir`, `Get-ClaudeDesktopProcess`, the three marker
+functions and the three shortcut functions now take `-Root` / `-Path` / `-Target`
+defaulting to the script-level values.
+
+The reason is a PowerShell scoping rule the plan did not account for: a function
+resolves variables through the scope it was **defined** in, so a test that sets
+`$script:InstallRoot` from the outside does not affect it. The first test run
+proved this the expensive way — 10 failures, and the suite had silently written a
+real `patched.json` into `%APPDATA%` and installed a real Start Menu shortcut,
+because the functions were reading live paths the whole time. Both were cleaned
+up. Passing paths in is also just better design, and production call sites are
+unchanged because of the defaults.
+
+**3. `.gitignore` had `tools/` blanket-ignored.** `tools/make-icon.ps1` would have
+been silently dropped, leaving `ClaudeBG.ico` as a committed binary nothing could
+reproduce — the exact failure TODO 1 existed to prevent. Narrowed to `tools/*`
+plus a `!tools/make-icon.ps1` exception.
+
+Two things worth recording that went right: the icon generator's round-trip check
+(`New-Object System.Drawing.Icon`) caught a real bug immediately — PowerShell
+unrolls a returned `byte[]` onto the pipeline, so the first `.ico` was 102 bytes
+of header with no image data. And `-Status` now returns in ~360ms against an
+`npx` cold start before.
+
+Measured on the dev machine after the change: `-Status` 361ms, full suite 7.9s,
+`powershell -NoProfile` cold start 598ms / 212ms warm.
 
 ## GSTACK REVIEW REPORT
 
