@@ -128,10 +128,42 @@ That's it. You're done.
 
 ---
 
-## Day-to-day use: the tray app
+## Day-to-day use: type "ClaudeBG"
 
-Instead of typing commands, you can double-click **`ClaudeBGTray.exe`**. It puts
-a small round icon in your notification area (bottom-right, near the clock) and
+After `-Patch`, press <kbd>Win</kbd>, type **`ClaudeBG`**, press Enter.
+
+That opens Claude Desktop **and** starts the small ClaudeBG icon in your
+notification area, in one go. Use it instead of Claude's own icon and your
+background is simply always on — there is nothing to remember to turn on.
+
+It also repairs itself. If Claude Desktop updated since you last used it, a
+notification tells you it's reapplying your background, it does the work, and
+then Claude opens with the picture already there. You do not have to notice that
+anything happened.
+
+Type it again while everything is already running and it just brings Claude up.
+No dialog, no second icon.
+
+> Windows can take a few seconds to index a brand-new Start Menu entry. If
+> searching finds nothing immediately after `-Patch`, wait a moment and try
+> again.
+
+To have the entry without the rest, or to check on it:
+
+```powershell
+.\ClaudeBG.ps1 -InstallShortcut
+.\ClaudeBG.ps1 -RemoveShortcut
+```
+
+`-Patch` installs it for you, and re-installs it every time it runs — so if you
+move this folder, running `-Patch` again fixes the shortcut. `-Restore` removes
+it. That does mean deleting the entry by hand won't stick while ClaudeBG is
+still patched; use `-Restore` if you want it gone for good.
+
+## The tray app
+
+You can also double-click **`ClaudeBGTray.exe`** directly. Either way you get a
+small round icon in your notification area (bottom-right, near the clock), and
 right-clicking it gives you everything:
 
 | Menu item | What it does |
@@ -159,8 +191,28 @@ picture is loaded when the window opens.
 
 ## When Claude updates
 
-Claude Desktop installs updates into a brand-new folder, so your background will
-just quietly stop appearing one day. Nothing is broken. Re-apply it:
+Claude Desktop installs updates into a brand-new folder, which used to mean your
+background just quietly stopped appearing one day.
+
+**You no longer have to do anything about this.** If you open Claude by typing
+`ClaudeBG`, it notices the update, tells you it's reapplying your background,
+does it, and then opens Claude. The first launch after an update takes an extra
+20 seconds or so; every other launch is unaffected.
+
+Two things to know: the repair needs Node.js, and it closes and reopens Claude
+Desktop as part of the work. If Node isn't available, Claude still opens — just
+without the background — and a message explains why.
+
+To check the state at any time:
+
+```powershell
+.\ClaudeBG.ps1 -Status
+```
+
+The `patch` line reads `current`, `STALE` (an update happened; the next launch
+will fix it), or `not patched`.
+
+If you'd rather repair it by hand:
 
 **Tray app:** right-click the icon → **Reapply patch**
 
@@ -273,19 +325,46 @@ any of it to use ClaudeBG.
 
 | path | what |
 |---|---|
-| `ClaudeBG.ps1` | everything: `-Patch`, `-SetImage`, `-SetOpacity`, `-Probe`, `-Status`, `-Restore` |
+| `ClaudeBG.ps1` | everything: `-Patch`, `-Launch`, `-SetImage`, `-SetOpacity`, `-Probe`, `-Status`, `-InstallShortcut`, `-RemoveShortcut`, `-Restore` |
 | `bg.css` | the art direction. Copied to `%APPDATA%\ClaudeBG\` on `-Patch`, read at page load, so edits apply with **Ctrl+R** — no repack |
 | `ClaudeBGTray.cs` / `ClaudeBGTray.exe` | tray front-end (WinForms, .NET Framework 4.8) |
+| `ClaudeBG.ico` | the icon, built into the exe. Regenerate with `tools\make-icon.ps1` — don't hand-edit it |
+| `tools/make-icon.ps1` | draws the icon at 16/32/48/256 and writes the `.ico` |
+| `ClaudeBG.Tests.ps1` | Pester suite. Run `Invoke-Pester` |
 | `demo-background.png` | a generated gradient, handy for testing without using a personal photo |
 | `spike/*.png` | screenshots from each step of the investigation — **gitignored**, since they show the sidebar with real conversation titles |
 
-Rebuild the tray app with the compiler Windows already ships — no SDK needed:
+Files it writes outside this folder:
+
+| path | what |
+|---|---|
+| `%APPDATA%\ClaudeBG\patched.json` | which `app-<version>` is patched. This is how a stale patch is detected |
+| `%APPDATA%\Microsoft\Windows\Start Menu\Programs\ClaudeBG.lnk` | the Start Menu entry |
+
+Both are removed by `-Restore`, along with the `.orig` backups.
+
+Rebuild the tray app with the compiler Windows already ships — no SDK needed.
+`/win32icon` is what puts the icon on the exe, the Start Menu entry, the taskbar
+and Alt-Tab, so don't drop it:
 
 ```powershell
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe `
-  /out:ClaudeBGTray.exe /reference:System.dll /reference:System.Drawing.dll `
+  /out:ClaudeBGTray.exe /win32icon:ClaudeBG.ico `
+  /reference:System.dll /reference:System.Drawing.dll `
   /reference:System.Windows.Forms.dll tray\ClaudeBGTray.cs
 ```
+
+Run the tests before committing changes to `ClaudeBG.ps1`:
+
+```powershell
+Invoke-Pester
+```
+
+Two of them are marked CRITICAL. One asserts that the process filter never
+matches `~\.local\bin\claude.exe` — that's the Claude Code CLI, and matching it
+would kill your own terminal session. The other asserts `-Restore` deletes the
+patch marker and both `.orig` backups, because leaving them behind makes ClaudeBG
+believe it is patched when it isn't, forever.
 
 ## How it works, and why it works this way
 

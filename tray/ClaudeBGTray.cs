@@ -10,10 +10,8 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
@@ -28,9 +26,6 @@ static class Program
     static readonly string ScriptPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ClaudeBG.ps1");
     static bool Busy = false;
 
-    [DllImport("user32.dll", SetLastError = true)]
-    static extern bool DestroyIcon(IntPtr handle);
-
     [STAThread]
     static void Main()
     {
@@ -41,12 +36,52 @@ static class Program
         {
             if (!isFirst)
             {
-                MessageBox.Show("ClaudeBG is already running - look for its icon in the notification area "
-                              + "(click the ^ arrow next to the clock if you don't see it).",
-                    "ClaudeBG", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                // This is someone typing "ClaudeBG" again while it is already
+                // running. That means "bring Claude up", not "tell me it is
+                // already running" - the old MessageBox here nagged on every
+                // launch after the first, which is exactly what would stop the
+                // Start Menu entry from becoming the way you open Claude.
+                LaunchOnly();
                 return;
             }
             Run();
+        }
+    }
+
+    // The second-instance path. It must pass -NoHeal: a heal calls
+    // Stop-ClaudeDesktop and repacks the archive for ~20 seconds, and this
+    // process has no tray, no balloon and no window to explain that with - it
+    // would just look like ClaudeBG killed your Claude. Healing is the first
+    // instance's job, where RunScript can narrate it.
+    //
+    // Deliberately NOT RunScript(): that touches Tray and Sync, which a second
+    // instance never initializes.
+    static void LaunchOnly()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + ScriptPath + "\" -Launch -NoHeal",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                p.WaitForExit();
+                if (p.ExitCode != 0)
+                    MessageBox.Show("Could not start Claude Desktop:\n\n" + output,
+                        "ClaudeBG", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Could not start Claude Desktop:\n\n" + ex.Message,
+                "ClaudeBG", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -81,6 +116,12 @@ static class Program
         Tray.BalloonTipText  = "Running in the notification area. Right-click the icon to change your background.";
         Tray.ShowBalloonTip(3000);
 
+        // Opening Claude and having the background on are one act now. -Launch
+        // resolves the active version, repairs the patch if a Claude update wiped
+        // it, and starts the app. RunScript gives it the balloon-on-success,
+        // dialog-on-failure treatment for free, so a heal narrates itself.
+        RunScript("-Launch", "Claude Desktop is ready.");
+
         Application.Run();
 
         Tray.Visible = false;
@@ -111,29 +152,19 @@ static class Program
         catch { }
     }
 
-    // Draw the tray icon at runtime so there's no separate asset file to ship.
+    // The icon is built into this exe by csc /win32icon:ClaudeBG.ico, so it is
+    // also what the Start Menu shortcut, Explorer and Alt-Tab show. Reading it
+    // back from our own executable keeps exactly one definition of the artwork.
+    // Regenerate the source file with tools\make-icon.ps1.
     static Icon MakeIcon()
     {
-        using (var bmp = new Bitmap(32, 32))
+        try
         {
-            using (var g = Graphics.FromImage(bmp))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                var rect = new Rectangle(2, 2, 28, 28);
-                using (var brush = new LinearGradientBrush(rect, Color.FromArgb(150, 60, 200), Color.FromArgb(255, 130, 60), 45f))
-                    g.FillEllipse(brush, rect);
-                using (var pen = new Pen(Color.FromArgb(230, 255, 255, 255), 2f))
-                    g.DrawEllipse(pen, rect);
-            }
-            // GetHicon hands back a handle we own; clone into a managed Icon and
-            // release it rather than leaking the HICON for the whole session.
-            IntPtr h = bmp.GetHicon();
-            try
-            {
-                using (var tmp = Icon.FromHandle(h)) return (Icon)tmp.Clone();
-            }
-            finally { DestroyIcon(h); }
+            Icon embedded = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            if (embedded != null) return embedded;
         }
+        catch (Exception) { /* fall through - a missing icon must never be fatal */ }
+        return SystemIcons.Application;
     }
 
     static ContextMenuStrip BuildMenu()

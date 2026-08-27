@@ -49,9 +49,20 @@
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
     [Parameter(ParameterSetName = 'Status')]  [switch] $Status,
+    # The fuse read and the signature check are the only slow things -Status does
+    # (npx cold start, then hashing claude.exe). Everyday questions - am I patched,
+    # is the patch stale, is the shortcut installed - must not wait behind them.
+    [Parameter(ParameterSetName = 'Status')]  [switch] $Deep,
     [Parameter(ParameterSetName = 'Patch')]   [switch] $Patch,
     [Parameter(ParameterSetName = 'Restore')] [switch] $Restore,
     [Parameter(ParameterSetName = 'Probe')]   [switch] $Probe,
+    [Parameter(ParameterSetName = 'Launch', Mandatory = $true)] [switch] $Launch,
+    # Set by the tray's SECOND instance. A launch must never patch: Invoke-Patch
+    # kills Claude, and a mutex-losing instance has no tray, no balloon and no
+    # window to explain a 20-second silence with.
+    [Parameter(ParameterSetName = 'Launch')] [switch] $NoHeal,
+    [Parameter(ParameterSetName = 'InstallShortcut', Mandatory = $true)] [switch] $InstallShortcut,
+    [Parameter(ParameterSetName = 'RemoveShortcut', Mandatory = $true)] [switch] $RemoveShortcut,
     [Parameter(ParameterSetName = 'SetImage', Mandatory = $true)] [string] $SetImage,
     [Parameter(ParameterSetName = 'SetImage')] [ValidateRange(0.0, 1.0)] [double] $Opacity = 0.35,
     [Parameter(ParameterSetName = 'SetOpacity', Mandatory = $true)] [ValidateRange(0.0, 1.0)] [double] $SetOpacity,
@@ -66,6 +77,12 @@ $DataDir     = Join-Path $env:APPDATA 'ClaudeBG'
 $ImagePath   = Join-Path $DataDir 'current.jpg'
 $LegacyImage = Join-Path $DataDir 'current.png'
 $ConfigPath  = Join-Path $DataDir 'config.json'
+# Patch state is recorded EXPLICITLY here, not inferred from the presence of the
+# .orig backups. Those persist across -Restore (it copies them back but has no
+# reason to delete them), so "backups exist" would report patched forever once
+# you had ever restored - and the launcher would then never repair anything.
+$MarkerPath  = Join-Path $DataDir 'patched.json'
+$ShortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'ClaudeBG.lnk'
 
 # The image crosses to the renderer as a base64 data: URI inside a single
 # webFrame.insertCSS call, and that call fails SILENTLY past a certain size -
@@ -89,33 +106,163 @@ function Write-Warn2{ param([string]$m) Write-Host "  $m" -ForegroundColor Yello
 # --- Resolve the version folder Claude actually launches -----------------------
 # RELEASES names the current package; fall back to numeric version sort (NEVER a
 # plain string sort: app-1.2.234 vs app-1.34493.1 only sorts right by accident).
+# -Root defaults to the real install but is a parameter so the tests can point it
+# at a fixture tree. A PowerShell function resolves variables through the scope it
+# was DEFINED in, so a test cannot override a script-level $InstallRoot from the
+# outside - it has to be passed in.
 function Get-ActiveAppDir {
-    $releases = Join-Path $InstallRoot 'packages\RELEASES'
+    param([string]$Root = $InstallRoot)
+    $releases = Join-Path $Root 'packages\RELEASES'
     if (Test-Path $releases) {
         $line = (Get-Content $releases | Where-Object { $_ -match 'AnthropicClaude-([0-9.]+)-full\.nupkg' } | Select-Object -Last 1)
         if ($line -match 'AnthropicClaude-([0-9.]+)-full\.nupkg') {
-            $candidate = Join-Path $InstallRoot "app-$($Matches[1])"
+            $candidate = Join-Path $Root "app-$($Matches[1])"
             if (Test-Path (Join-Path $candidate 'resources\app.asar')) { return $candidate }
         }
     }
-    $dirs = Get-ChildItem $InstallRoot -Directory -ErrorAction SilentlyContinue |
+    $dirs = Get-ChildItem $Root -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like 'app-*' -and (Test-Path (Join-Path $_.FullName 'resources\app.asar')) }
-    if (-not $dirs) { throw "No Claude Desktop install found under $InstallRoot" }
+    if (-not $dirs) { throw "No Claude Desktop install found under $Root" }
     return ($dirs | Sort-Object { try { [version]($_.Name -replace '^app-','') } catch { [version]'0.0.0' } } | Select-Object -Last 1).FullName
 }
 
-# Only ever kill the Desktop app. ~\.local\bin\claude.exe is the Claude Code CLI -
-# killing that would take out the user's own terminal session.
+# THE filter. Only ever match the Desktop app: ~\.local\bin\claude.exe is the
+# Claude Code CLI, and matching it would take out the user's own terminal
+# session. This lives in exactly one place on purpose - it was previously
+# hand-copied per call site, and every copy is a chance for someone to write the
+# more natural-looking `Get-Process claude` and end their own session.
+function Get-ClaudeDesktopProcess {
+    param([string]$Root = $InstallRoot)
+    return @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$Root\*" })
+}
+
 function Stop-ClaudeDesktop {
-    $p = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallRoot\*" }
+    $p = Get-ClaudeDesktopProcess
     if ($p) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
     for ($i = 0; $i -lt 20; $i++) {
-        if (-not (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallRoot\*" })) {
+        if (-not (Get-ClaudeDesktopProcess)) {
             Start-Sleep -Milliseconds 800   # let Windows release the exe/asar file locks
             return
         }
         Start-Sleep -Milliseconds 250
     }
+}
+
+# --- Patch state ---------------------------------------------------------------
+# "Patched" means: the marker exists AND it names the version Claude is actually
+# launching today. A Claude auto-update lands in a fresh app-<version> folder, so
+# the version stops matching and the state becomes Stale - which is the whole
+# signal the launcher's auto-heal runs on.
+function Write-PatchMarker {
+    param([string]$AppDir, [string]$Path = $MarkerPath)
+    New-Item -ItemType Directory -Force -Path (Split-Path $Path -Parent) | Out-Null
+    $json = @{
+        version   = (Split-Path $AppDir -Leaf)
+        exe       = (Join-Path $AppDir 'claude.exe')
+        patchedAt = (Get-Date).ToString('o')
+    } | ConvertTo-Json
+    # BOM-less, same trap as config.json: a leading U+FEFF breaks JSON.parse.
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Any unreadable marker - missing, truncated by a crash mid-write, hand-edited -
+# is treated as "not patched". Repairing when we did not need to is cheap and
+# visible; skipping a repair we did need is the silent failure.
+function Read-PatchMarker {
+    param([string]$Path = $MarkerPath)
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $m = Get-Content $Path -Raw | ConvertFrom-Json
+        if (-not $m.version) { return $null }
+        return $m
+    } catch { return $null }
+}
+
+function Remove-PatchMarker {
+    param([string]$Path = $MarkerPath)
+    if (Test-Path $Path) { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-PatchState {
+    param([string]$AppDir, [string]$Path = $MarkerPath)
+    $m = Read-PatchMarker -Path $Path
+    if (-not $m)                                   { return 'Unpatched' }
+    if ($m.version -eq (Split-Path $AppDir -Leaf)) { return 'Patched' }
+    return 'Stale'
+}
+
+# --- Start Menu shortcut -------------------------------------------------------
+# Per-user Programs folder only. The README promises no administrator rights, and
+# the all-users Start Menu would need them.
+function Get-TrayExePath { return (Join-Path $PSScriptRoot 'ClaudeBGTray.exe') }
+
+function Install-Shortcut {
+    param([string]$Path = $ShortcutPath, [string]$Target = (Get-TrayExePath))
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $lnk = $shell.CreateShortcut($Path)
+        $lnk.TargetPath       = $Target
+        $lnk.WorkingDirectory = (Split-Path $Target -Parent)
+        $lnk.Description      = 'Claude Desktop, with your background'
+        # No IconLocation on purpose: ClaudeBGTray.exe carries ClaudeBG.ico
+        # embedded via csc /win32icon, and a shortcut with no icon override
+        # inherits its target's. One definition of the artwork, and it styles the
+        # exe in Explorer and Alt-Tab too, not just this shortcut.
+        $lnk.Save()
+    } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+}
+
+function Remove-Shortcut {
+    param([string]$Path = $ShortcutPath)
+    if (Test-Path $Path) { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-ShortcutTarget {
+    param([string]$Path = $ShortcutPath)
+    if (-not (Test-Path $Path)) { return $null }
+    $shell = New-Object -ComObject WScript.Shell
+    try { return $shell.CreateShortcut($Path).TargetPath }
+    catch { return $null }
+    finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+}
+
+# --- Launch decision -----------------------------------------------------------
+# PURE. No processes, no Node, no Claude install, no disk. Every branch of the
+# launcher is decided here so all of them can be tested in milliseconds on a
+# machine that has never had Claude Desktop on it.
+#
+#                          Get-LaunchPlan
+#                                |
+#         no AppDir  ------------+------------  AppDir known
+#             |                                      |
+#           Fail                        PatchState -eq 'Patched' ?
+#                                          |                 |
+#                                        no                 yes
+#                                          |                 |
+#                                    NoHeal ?          ClaudeRunning ?
+#                                     |     |             |        |
+#                                    yes    no          yes       no
+#                                     |     |             |        |
+#                          ClaudeRunning?  Heal         NoOp    Launch
+#                            |        |
+#                          yes       no
+#                            |        |
+#                       WarnOnly  WarnAndLaunch
+function Get-LaunchPlan {
+    param(
+        [string] $AppDir,
+        [string] $PatchState,
+        [bool]   $ClaudeRunning,
+        [bool]   $NoHeal
+    )
+    if ([string]::IsNullOrEmpty($AppDir)) { return 'Fail' }
+    if ($PatchState -ne 'Patched') {
+        if (-not $NoHeal)  { return 'Heal' }
+        if ($ClaudeRunning){ return 'WarnOnly' }
+        return 'WarnAndLaunch'
+    }
+    if ($ClaudeRunning) { return 'NoOp' }
+    return 'Launch'
 }
 
 function Start-ClaudeDesktop { param([string]$AppDir) Start-Process (Join-Path $AppDir 'claude.exe') | Out-Null }
@@ -267,6 +414,64 @@ function __cbgCapture(caps,path){
 }}catch(x){}
 '@
 
+# The effects half of the launcher. Everything decidable lives in Get-LaunchPlan
+# above; this only carries it out.
+function Invoke-Launch {
+    param([switch]$NoHeal)
+
+    $appDir = $null
+    try { $appDir = Get-ActiveAppDir } catch { $appDir = $null }
+
+    $state   = if ($appDir) { Get-PatchState -AppDir $appDir } else { 'Unpatched' }
+    $running = [bool](Get-ClaudeDesktopProcess)
+    $plan    = Get-LaunchPlan -AppDir $appDir -PatchState $state `
+                              -ClaudeRunning $running -NoHeal $NoHeal.IsPresent
+
+    switch ($plan) {
+        'Fail' { throw "No Claude Desktop install found under $InstallRoot" }
+
+        'NoOp' { Write-Ok "Claude Desktop is already running."; return }
+
+        'Launch' {
+            Start-ClaudeDesktop -AppDir $appDir
+            Write-Ok "Claude Desktop started."
+            return
+        }
+
+        'Heal' {
+            Write-Step "Claude updated - reapplying your background before launching..."
+            try {
+                # Invoke-Patch ends by starting Claude itself. Returning here is
+                # what keeps the launcher from racing it: Start-Process returns
+                # before the new process is visible to Get-Process, so a second
+                # "is it running yet?" check could miss it and open a second window.
+                Invoke-Patch
+                return
+            } catch {
+                # Node missing is the common case here (Assert-Node throws, and
+                # $ErrorActionPreference is Stop). Never let that stop Claude from
+                # opening - a missing background is a papercut, a launcher that
+                # refuses to launch is a broken tool.
+                Write-Warn2 "Could not reapply the background: $($_.Exception.Message)"
+                Write-Warn2 "Starting Claude Desktop without it."
+                if (-not (Get-ClaudeDesktopProcess)) { Start-ClaudeDesktop -AppDir $appDir }
+                return
+            }
+        }
+
+        'WarnAndLaunch' {
+            Write-Warn2 "Your background is off for this Claude version. Run: .\ClaudeBG.ps1 -Patch"
+            Start-ClaudeDesktop -AppDir $appDir
+            return
+        }
+
+        'WarnOnly' {
+            Write-Warn2 "Your background is off for this Claude version. Run: .\ClaudeBG.ps1 -Patch"
+            return
+        }
+    }
+}
+
 function Invoke-Patch {
     Assert-Node
     $appDir = Get-ActiveAppDir
@@ -349,6 +554,20 @@ function Invoke-Patch {
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 
     if (-not (Get-CurrentImage)) { Write-Warn2 "No background set yet. Run: .\ClaudeBG.ps1 -SetImage <path>" }
+
+    # Only now, with the patched archive actually in place, is it true.
+    Write-PatchMarker -AppDir $appDir
+    Write-Ok "Recorded patch state for $(Split-Path $appDir -Leaf)."
+
+    # Recreated on every patch, including auto-heal, so a moved repo folder
+    # self-corrects. -Restore is the way to opt out of having the entry at all.
+    try {
+        Install-Shortcut
+        Write-Ok "Start Menu shortcut installed - type `"ClaudeBG`"."
+    } catch {
+        Write-Warn2 "Could not write the Start Menu shortcut: $($_.Exception.Message)"
+    }
+
     Start-ClaudeDesktop -AppDir $appDir
     Write-Ok "Patch complete. Claude Desktop restarted."
 }
@@ -468,11 +687,25 @@ function Invoke-Restore {
     Stop-ClaudeDesktop
     if (Test-Path "$asar.orig") { Copy-Item "$asar.orig" $asar -Force; Write-Ok "Restored original app.asar." } else { Write-Warn2 "No app.asar.orig backup found." }
     if (Test-Path "$exe.orig")  { Copy-Item "$exe.orig"  $exe  -Force; Write-Ok "Restored original claude.exe (signature + integrity fuse back)." } else { Write-Warn2 "No claude.exe.orig backup found." }
+
+    # Leaving these behind used to make "-Restore puts them back exactly" false,
+    # and would strand hundreds of MB of backups. It also matters for correctness
+    # now: anything still treating .orig presence as "patched" would be wrong.
+    Remove-Item "$asar.orig" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$exe.orig"  -Force -ErrorAction SilentlyContinue
+    if (Test-Path "$asar.orig.unpacked") { Remove-Item "$asar.orig.unpacked" -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Ok "Removed backups."
+
+    Remove-PatchMarker
+    Remove-Shortcut
+    Write-Ok "Removed patch marker and Start Menu shortcut."
+
     Start-ClaudeDesktop -AppDir $appDir
     Write-Ok "Restored. Claude Desktop restarted."
 }
 
 function Invoke-Status {
+    param([switch]$Deep)
     $appDir = Get-ActiveAppDir
     $res  = Join-Path $appDir 'resources'
     $asar = Join-Path $res 'app.asar'
@@ -480,14 +713,39 @@ function Invoke-Status {
     Write-Host ""
     Write-Host "ClaudeBG status" -ForegroundColor White
     Write-Host "  active install : $appDir"
+
+    # Everything above the -Deep block is local file reads, so plain -Status stays
+    # instant and needs no Node at all.
+    $state  = Get-PatchState -AppDir $appDir
+    $marker = Read-PatchMarker
+    switch ($state) {
+        'Patched'   { Write-Host "  patch          : current ($($marker.version))" -ForegroundColor Green }
+        'Stale'     { Write-Host "  patch          : STALE - patched $($marker.version), Claude now runs $(Split-Path $appDir -Leaf). Next launch repairs it." -ForegroundColor Yellow }
+        'Unpatched' { Write-Host "  patch          : not patched. Run: .\ClaudeBG.ps1 -Patch" -ForegroundColor Yellow }
+    }
+
+    $target = Get-ShortcutTarget
+    $want   = Get-TrayExePath
+    if (-not $target) {
+        Write-Host "  start menu     : not installed. Run: .\ClaudeBG.ps1 -InstallShortcut" -ForegroundColor Yellow
+    } elseif ($target -ne $want) {
+        Write-Host "  start menu     : MISMATCH - points at $target (expected $want). Re-run -Patch." -ForegroundColor Yellow
+    } else {
+        Write-Host "  start menu     : installed (type `"ClaudeBG`")" -ForegroundColor Green
+    }
+
     Write-Host "  app.asar       : $([math]::Round((Get-Item $asar).Length/1MB,1)) MB"
     Write-Host "  backups        : asar=$(Test-Path "$asar.orig")  exe=$(Test-Path "$exe.orig")"
-    try {
-        $f = (& npx --yes @electron/fuses read --app $exe 2>$null | Select-String 'EnableEmbeddedAsarIntegrityValidation')
-        # NB: '.*is' is greedy and eats into "D-is-abled", printing "abled".
-        Write-Host "  integrity fuse : $(if ($f -match '\b(Enabled|Disabled)\b') { $Matches[1] } else { '(unknown)' })"
-    } catch { Write-Host "  integrity fuse : (unknown - is Node installed?)" }
-    Write-Host "  signature      : $((Get-AuthenticodeSignature $exe).Status)"
+
+    if ($Deep) {
+        try {
+            $f = (& npx --yes @electron/fuses read --app $exe 2>$null | Select-String 'EnableEmbeddedAsarIntegrityValidation')
+            # NB: '.*is' is greedy and eats into "D-is-abled", printing "abled".
+            Write-Host "  integrity fuse : $(if ($f -match '\b(Enabled|Disabled)\b') { $Matches[1] } else { '(unknown)' })"
+        } catch { Write-Host "  integrity fuse : (unknown - is Node installed?)" }
+        Write-Host "  signature      : $((Get-AuthenticodeSignature $exe).Status)"
+    }
+
     $cur = Get-CurrentImage
     Write-Host "  background     : $(if ($cur) { "$cur  ($([math]::Round((Get-Item $cur).Length/1KB)) KB)" } else { '(none set)' })"
     $style = Join-Path $DataDir 'bg.css'
@@ -498,11 +756,20 @@ function Invoke-Status {
     Write-Host ""
 }
 
-switch ($PSCmdlet.ParameterSetName) {
-    'Patch'    { Invoke-Patch }
-    'Restore'  { Invoke-Restore }
-    'Probe'    { Invoke-Probe }
-    'SetImage'   { Invoke-SetImage   -Path $SetImage -Op $Opacity -SkipRestart:$NoRestart }
-    'SetOpacity' { Invoke-SetOpacity -Op $SetOpacity -SkipRestart:$NoRestart }
-    default    { Invoke-Status }
+# Dot-sourcing this file (`. .\ClaudeBG.ps1`) must define the functions and do
+# nothing else. Without this guard it would fall through to Invoke-Status, which
+# shells out to npx and hashes claude.exe - so the Pester suite could not load the
+# script at all without several seconds of work against the real install.
+if ($MyInvocation.InvocationName -ne '.') {
+    switch ($PSCmdlet.ParameterSetName) {
+        'Patch'      { Invoke-Patch }
+        'Restore'    { Invoke-Restore }
+        'Probe'      { Invoke-Probe }
+        'Launch'     { Invoke-Launch -NoHeal:$NoHeal }
+        'InstallShortcut' { Install-Shortcut; Write-Ok "Start Menu shortcut installed - type `"ClaudeBG`"." }
+        'RemoveShortcut'  { Remove-Shortcut;  Write-Ok "Start Menu shortcut removed." }
+        'SetImage'   { Invoke-SetImage   -Path $SetImage -Op $Opacity -SkipRestart:$NoRestart }
+        'SetOpacity' { Invoke-SetOpacity -Op $SetOpacity -SkipRestart:$NoRestart }
+        default      { Invoke-Status -Deep:$Deep }
+    }
 }

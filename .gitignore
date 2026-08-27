@@ -2,7 +2,11 @@
 *.userbackup
 domdump.json
 status.log
-tools/
+
+# tools/ is scratch space, EXCEPT the icon generator: ClaudeBG.ico is a committed
+# binary and this is the only thing that can reproduce it.
+tools/*
+!tools/make-icon.ps1
 
 # Screenshots from the investigation. Kept locally, never committed: they show
 # the Claude sidebar in full, which means real conversation titles and account
