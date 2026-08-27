@@ -112,54 +112,236 @@ reuses it rather than reimplementing it.
 
 Concretely:
 
-**1. `ClaudeBG.ps1` gains `-Launch`.**
-```
-$appDir  = Get-ActiveAppDir                       # existing, RELEASES-aware
-$patched = (Test-Path "$appDir\resources\app.asar.orig") -and
-           (Test-Path "$appDir\claude.exe.orig")
-if (-not $patched) { Invoke-Patch }               # existing
-if (-not (Get-Process | ? { $_.Path -like "$InstallRoot\*" })) {
-    Start-ClaudeDesktop -AppDir $appDir           # existing
-}
-```
-The patch check is two file-existence tests. No Node, no `npx`, no
-`@electron/fuses` — the slow probe in `Invoke-Status` is not needed here, and
-using it would put several seconds of `npx` cold start in front of every launch.
+**1. Patch state becomes an explicit marker, not a proxy** (eng review, Issue 1).
 
-**2. `ClaudeBG.ps1` gains `-InstallShortcut` / `-RemoveShortcut`.**
+The original design read patch state from the presence of `app.asar.orig` and
+`claude.exe.orig`. That is wrong: `Invoke-Restore` (`ClaudeBG.ps1:463-473`)
+copies the backups back but never deletes them, and no `Remove-Item` in the file
+touches a `.orig`. After a restore the launcher would report "patched" forever
+and never repair anything again.
+
+- `Invoke-Patch` writes `%APPDATA%\ClaudeBG\patched.json` recording the
+  `app-<version>` it patched and the resolved `claude.exe` path.
+- Patched means: marker exists **and** its version equals `Get-ActiveAppDir`'s.
+  A version mismatch is the STALE state — Claude updated, next launch repairs.
+- `Invoke-Restore` deletes the marker **and** both `.orig` backups. This also
+  makes the README's "`-Restore` puts them back exactly" literally true and
+  reclaims the backup disk space.
+
+Still no Node and no `npx` on this path: one small JSON read plus the existing
+`RELEASES` parse.
+
+**2. The `-Launch` state machine** (eng review, Issue 2).
+
+The original six-line pseudocode had three defects: an unguarded `Invoke-Patch`
+aborts the script when Node is missing (`Assert-Node` throws at `:143`,
+`$ErrorActionPreference = 'Stop'` at `:63`), so Claude never opens; `Invoke-Patch`
+already launches Claude at `:352`, so the follow-up launch guard can race
+`Start-Process` and open a second window; and the mutex-losing instance would run
+the heal with no tray, no balloon and no window at all.
+
+Decision is separated from effect. `Get-LaunchPlan` is pure — no processes, no
+Node, no Claude install required — which is what makes the five states testable.
+
+```
+                        Get-LaunchPlan (PURE)
+                                 |
+        +------------+-----------+-----------+--------------+
+        |            |                       |              |
+   no install    marker absent          marker version   marker version
+        |         or corrupt             != active         == active
+        |            |                       |              |
+      Fail       +---+---+               +---+---+          |
+                 |       |               | (STALE)|         |
+              -NoHeal   heal             same as left       |
+                 |       |                                  |
+        WarnAndLaunch   Heal                        +--------+--------+
+                                                    |                 |
+                                              Claude running?    not running
+                                                    |                 |
+                                                  NoOp             Launch
+
+   Heal          -> Invoke-Patch (announces via balloon, kills + relaunches
+                    Claude itself at :352) then RETURN. Never falls through
+                    to Launch, which is what removes the double-launch race.
+   WarnAndLaunch -> warn that the background is off, then Launch anyway.
+                    This is also the Node-missing path: the heal is wrapped in
+                    try/catch and a failure degrades to WarnAndLaunch, so
+                    Success Criterion 5 is actually reachable.
+   NoOp          -> Claude is already up. Do nothing.
+   Fail          -> no Claude Desktop install found. Report it.
+```
+
+`-Launch` takes a `-NoHeal` switch. The mutex-losing second tray instance always
+passes it, so a second launch can never patch, never call `Stop-ClaudeDesktop`,
+and never kill the Claude the first instance is managing.
+
+**3. `Get-ClaudeDesktopProcess` is extracted** (eng review, Issue 4).
+
+The install-path filter at `ClaudeBG.ps1:110` appears twice already and the
+original design inlined a third copy. It becomes one function, carrying its own
+warning comment, used by `Stop-ClaudeDesktop`'s two call sites and by
+`Get-LaunchPlan`. Its failure mode is killing the user's own Claude Code CLI at
+`~\.local\bin\claude.exe`, so it exists exactly once.
+
+**4. `ClaudeBG.ps1` gains `-InstallShortcut` / `-RemoveShortcut`.**
 `WScript.Shell` COM writes `ClaudeBG.lnk` into the per-user Programs folder,
-`TargetPath` = `ClaudeBGTray.exe`, `IconLocation` = the generated `.ico`,
-`WorkingDirectory` = the repo folder (the tray resolves `ClaudeBG.ps1` relative
-to its own `BaseDirectory`, so this is belt-and-braces). Release the COM object
-explicitly. `-Patch` calls install; `-Restore` calls remove.
+`TargetPath` = `ClaudeBGTray.exe`, `WorkingDirectory` = the repo folder. No
+`IconLocation` — see 5. Release the COM object explicitly. `-Patch` calls
+install; `-Restore` calls remove.
 
-**3. The tray's two startup paths both become launchers.**
+**5. The icon is a build-time asset** (eng review, Issue 3).
+
+Not generated at runtime. `tools/make-icon.ps1` (currently an empty directory)
+draws the disc and writes `ClaudeBG.ico` at 16/32/48/256; the file is committed;
+the tray is built with the `csc` line at `README.md:286` plus
+`/win32icon:ClaudeBG.ico`. A shortcut with no `IconLocation` inherits its
+target's embedded icon automatically.
+
+This deletes rather than adds code. `MakeIcon` (`tray/ClaudeBGTray.cs:115-137`),
+the `DllImport` of `DestroyIcon` (`:31-32`), and the HICON leak handling
+(`:130-135`) all go away, replaced by
+`Icon.ExtractAssociatedIcon(Application.ExecutablePath)`. One definition of the
+artwork instead of two, and the icon now styles the exe in Explorer, Alt-Tab and
+the taskbar, not just the shortcut.
+
+**6. The tray's two startup paths both become launchers.**
 - First instance: after `EnsureSync()` and `Tray.Visible = true`, call
   `RunScript("-Launch", ...)`. Balloon and error dialog come for free.
 - Second instance (`isFirst == false`): replace the MessageBox at
-  `tray/ClaudeBGTray.cs:44` with a direct hidden `powershell.exe -Launch`, then
-  exit. Typing ClaudeBG while it's already running brings Claude up instead of
-  nagging. This second path must not use `RunScript`, which touches `Tray` and
-  `Sync` that a second instance never initializes.
+  `tray/ClaudeBGTray.cs:44` with a direct hidden `powershell.exe -Launch -NoHeal`,
+  then exit. Typing ClaudeBG while it's already running brings Claude up instead
+  of nagging. This path must not use `RunScript`, which touches `Tray` and `Sync`
+  that a second instance never initializes.
+
+**7. `-Status` reports the new truth** (eng review, Issues 5 and 7, TODO 2).
+
+Adds patch state (current / STALE / not patched) and a shortcut line that
+compares the `.lnk`'s `TargetPath` against `$PSScriptRoot\ClaudeBGTray.exe`,
+reporting `MISMATCH - re-run -Patch` when the repo has moved. These print
+*first*. The `npx @electron/fuses` probe (`:486`) and the Authenticode check
+(`:490`) move behind a new `-Deep` switch, so plain `-Status` is instant and has
+no Node dependency at all.
 
 ## Open Questions
 
-- **Where does the `.ico` get written?** A real multi-resolution `.ico`
-  (16/32/48/256) means assembling the ICONDIR / ICONDIRENTRY container by hand —
-  roughly 40 lines of binary writing in either language, and the fiddliest part of
-  this whole design. Two options: PowerShell redraws the disc and writes the
-  container (duplicates the drawing from `MakeIcon`), or `ClaudeBGTray.exe` gains
-  an `--export-icon <path>` argument that reuses `MakeIcon` directly (one copy of
-  the drawing, but `Main` has to start parsing arguments). Leaning toward the
-  tray flag.
-- **Claude running but unpatched.** `Invoke-Patch` calls `Stop-ClaudeDesktop`, so
-  `-Launch` will kill and relaunch a running Claude to repair it. Correct, but it
-  should be visible in the balloon text rather than a surprise. Alternative: skip
-  the repair when Claude is already up and heal on the next cold launch.
-- **Node missing.** Confirm the intended fallback is "open Claude anyway,
-  unpatched, and show the failure dialog" rather than blocking the launch.
-- **`-Patch` re-running install every time** is idempotent and cheap, but it will
-  silently recreate the shortcut if the user deliberately deleted it. Acceptable?
+All four original questions were closed during eng review.
+
+- ~~Where does the `.ico` get written?~~ **Resolved:** nowhere at runtime. It is a
+  build-time asset generated once by `tools/make-icon.ps1`, committed, and
+  embedded with `/win32icon`. All ICO-container code disappears from the design.
+- ~~Claude running but unpatched.~~ **Resolved:** the first tray instance heals,
+  which does kill and relaunch Claude, announced by a balloon before the work
+  starts. The second instance passes `-NoHeal` and can never do this.
+- ~~Node missing.~~ **Resolved:** the heal is wrapped in try/catch and degrades to
+  WarnAndLaunch. Claude always opens; the dialog explains why the background is
+  off.
+- ~~`-Patch` recreating a deleted shortcut.~~ **Resolved (Issue 8):** leave it.
+  `-Patch` always reinstalls, which is what makes the moved-repo case self-heal
+  on the next auto-heal. Deleting the shortcut while keeping the patch is a
+  hypothetical need; `-Restore` is the real opt-out. Document the behavior in the
+  README rather than adding preference state to `patched.json`.
+
+No unresolved decisions remain.
+
+## Test Plan
+
+The repo has no test infrastructure today: no `package.json`, no `Makefile`, and
+zero test files in `git ls-files`. Two structural changes make testing possible
+at all, and both are good design independently.
+
+**Blocker 1 — the script executes on load.** `[CmdletBinding(DefaultParameterSetName
+= 'Status')]` (`:55`) plus the bare `switch` at `:501-508` mean dot-sourcing the
+script runs `Invoke-Status`, which shells to `npx` and hashes `claude.exe`. Guard
+the switch so it only fires on direct invocation, not on dot-source.
+
+**Blocker 2 — decisions are tangled with effects.** Hence `Get-LaunchPlan` above.
+
+Pester suite (`ClaudeBG.Tests.ps1`) covering:
+
+| Unit | Cases |
+|---|---|
+| `Get-LaunchPlan` | NoOp, Launch, Heal, WarnAndLaunch, Fail — all five, no install needed |
+| `Read-PatchMarker` | absent, version match, version drift (STALE), corrupt JSON |
+| `Get-ActiveAppDir` | `RELEASES` names current pkg; `RELEASES` absent → `[version]` sort; no install → throw |
+| `Get-ClaudeDesktopProcess` | matches `$InstallRoot\*`; **never** matches `~\.local\bin\claude.exe` |
+| `Invoke-Restore` | deletes marker **and** both `.orig` files |
+| `Install-Shortcut` / `Remove-Shortcut` | create, overwrite, remove-when-absent |
+
+Two cases are **CRITICAL** and non-negotiable, because both fail silently:
+`Invoke-Restore`'s cleanup (regressing it reinstates the Issue 1 permanent
+false-positive) and `Get-ClaudeDesktopProcess`'s exclusion of the Claude Code CLI
+(regressing it kills your terminal session).
+
+`Get-ActiveAppDir` has zero tests today and is the function the project's own
+learnings flag as easiest to get wrong. It gets tests here even though this
+change does not modify it.
+
+A QA-facing version of this lives at
+`~/.gstack/projects/ClaudeCSS/Addis-main-eng-review-test-plan-20260827-104500.md`.
+
+## What Already Exists
+
+Everything reused, and confirmed not rebuilt:
+
+| Existing | Location | Used for |
+|---|---|---|
+| `Get-ActiveAppDir` | `ClaudeBG.ps1:88` | RELEASES-aware version resolution |
+| `Start-ClaudeDesktop` | `ClaudeBG.ps1:121` | launching the right `claude.exe` |
+| `Stop-ClaudeDesktop` | `ClaudeBG.ps1:109` | the install-path process filter |
+| `Invoke-Patch` | `ClaudeBG.ps1:270` | the repair itself, and it already relaunches Claude at `:352` |
+| `RunScript` | `tray/ClaudeBGTray.cs:243` | hidden PowerShell + balloon/dialog UX, free |
+| `Notify` | `tray/ClaudeBGTray.cs:295` | the balloon |
+| single-instance mutex | `tray/ClaudeBGTray.cs:40` | second-launch detection |
+
+Only `MakeIcon` is *replaced* rather than reused, and that is a deletion.
+
+## NOT In Scope
+
+- **Auto-start on boot.** Explicitly rejected in the prior design doc and still
+  rejected. This is a user-initiated launcher, not a startup service.
+- **Pinning to Start or the taskbar.** Windows has blocked programmatic pinning
+  since Windows 10. Manual right-click only; not a limitation worth fighting.
+- **A Start Menu folder with multiple entries** (Approach C from the design
+  session). One entry, deliberately.
+- **Live-wallpaper icon.** Rejected on merit: Windows caches shortcut icons hard
+  enough that it would routinely show the previous image.
+- **CI/CD and release artifacts.** The repo is distributed by clone and built with
+  one `csc` line. No pipeline is warranted for a personal tool.
+- **C# unit tests.** The tray changes are thin wiring over tested PowerShell.
+  Standing up a .NET test project for two startup branches is not worth it.
+- **Fixing the `.lnk`'s absolute-path fragility.** Detected and reported by
+  `-Status` (TODO 2), not solved. A relocatable launcher is a different design.
+
+## Failure Modes
+
+| Codepath | Realistic production failure | Test? | Handled? | Visible? |
+|---|---|---|---|---|
+| `Read-PatchMarker` | corrupt/partial JSON after a crash mid-write | yes | treat as unpatched | yes, heals |
+| `Get-LaunchPlan` | marker says patched, files actually gone | yes | version compare catches drift only | **partly** — see below |
+| heal path | Node absent on PATH | yes | try/catch → WarnAndLaunch | yes, dialog |
+| heal path | `claude.exe` still locked after exit | no | existing 6-attempt retry at `:295-301` | yes, throws |
+| `Get-ClaudeDesktopProcess` | matches the Claude Code CLI | yes | install-path filter | **no — silent, CRITICAL** |
+| `Invoke-Restore` | leaves marker or `.orig` behind | yes | explicit deletes | **no — silent, CRITICAL** |
+| `Install-Shortcut` | COM object not released, handle leak | no | explicit `ReleaseComObject` | no |
+| `.lnk` target | repo folder moved | no | none | yes, `-Status` reports MISMATCH |
+
+Both CRITICAL rows are silent-and-damaging, which is exactly why their tests are
+mandatory rather than optional.
+
+One residual gap worth naming: if someone manually deletes the patched `app.asar`
+without touching `patched.json`, the marker still matches the active version and
+the launcher reports healthy. Detecting that needs a content check (hash or
+signature), which was rejected as too expensive for the hot path. Accepted risk —
+it requires deliberate hand-editing of program files.
+
+## Parallelization
+
+Sequential implementation, no parallelization opportunity. Every step funnels
+through `ClaudeBG.ps1`, and the tray changes depend on `-Launch` and `-NoHeal`
+existing first. Two lanes could in principle run apart — `tools/make-icon.ps1`
+plus the `.ico` is independent of everything until the `csc` rebuild — but the
+saving is minutes and it is one file.
 
 ## Success Criteria
 
@@ -173,6 +355,11 @@ explicitly. `-Patch` calls install; `-Restore` calls remove.
    nothing.
 5. On a machine without Node: Claude still opens, and the dialog explains why the
    background is off.
+6. With the Claude Code CLI running throughout every test above, it is **never**
+   touched. Verified by a test, not by observation.
+7. Plain `.\ClaudeBG.ps1 -Status` returns instantly, with no Node on PATH, and
+   reports patch state, staleness, and the shortcut's target.
+8. `Invoke-Pester` is green, including both CRITICAL cases.
 
 ## Distribution Plan
 
@@ -185,22 +372,54 @@ line at `README.md:286`. The only new distribution obligation is documenting the
 Start Menu entry in the "Day-to-day use" section (`README.md:131`) and adding
 `ClaudeBG.ico` to the file table (`README.md:278`).
 
-## Next Steps
+## Implementation Tasks
 
-1. Add `-Launch` to `ClaudeBG.ps1` and test it standalone from a terminal, in all
-   four states: patched + Claude closed, patched + Claude open, unpatched, and
-   Node absent. This is the whole design; get it right before any shortcut exists.
-2. Decide the `.ico` question above, then generate `ClaudeBG.ico` and eyeball it
-   at 16px — the white ring on the gradient disc is the detail most likely to turn
-   to mush at small sizes.
-3. Add `-InstallShortcut` / `-RemoveShortcut`; wire them into `Invoke-Patch` and
-   `Invoke-Restore`. Verify Windows Search actually finds "ClaudeBG" (indexing can
-   lag a few seconds on first write).
-4. Change the tray's two startup paths. Rebuild with the `csc` line from
-   `README.md:286`.
-5. Run the full loop end to end, then deliberately break it: delete the `.orig`
-   files to simulate an update and confirm the balloon-then-repair path works.
-6. Update `README.md:131` and `README.md:278`.
+Synthesized from this review's findings. Each task derives from a specific
+finding above. Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T1 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Guard the trailing `switch` so the script is dot-sourceable
+  - Surfaced by: Test review, Issue 6 — `:55` + `:501-508` run `Invoke-Status` on load, which shells to `npx`
+  - Files: `ClaudeBG.ps1`
+  - Verify: `. .\ClaudeBG.ps1` returns instantly and defines functions without printing status
+- [ ] **T2 (P1, human: ~45min / CC: ~8min)** — ClaudeBG.ps1 — Add `patched.json` marker; write in `Invoke-Patch`, delete it and both `.orig` in `Invoke-Restore`
+  - Surfaced by: Architecture, Issue 1 — `:463-473` restores backups but never deletes them
+  - Files: `ClaudeBG.ps1`
+  - Verify: `-Patch` then `-Restore`, then confirm marker and both `.orig` files are gone
+- [ ] **T3 (P2, human: ~20min / CC: ~4min)** — ClaudeBG.ps1 — Extract `Get-ClaudeDesktopProcess`, use it in all three call sites
+  - Surfaced by: Code quality, Issue 4 — filter duplicated at `:110`, `:112`, and again in the plan
+  - Files: `ClaudeBG.ps1`
+  - Verify: Pester case asserts `~\.local\bin\claude.exe` is never matched
+- [ ] **T4 (P1, human: ~1h / CC: ~10min)** — ClaudeBG.ps1 — Add pure `Get-LaunchPlan` plus `-Launch` / `-NoHeal`
+  - Surfaced by: Architecture, Issue 2 — Node throw aborts launch, double-launch race, silent second instance
+  - Files: `ClaudeBG.ps1`
+  - Verify: all five plan states return correctly with no Claude install present
+- [ ] **T5 (P2, human: ~20min / CC: ~4min)** — tools — Write `tools/make-icon.ps1`, generate and commit `ClaudeBG.ico`
+  - Surfaced by: TODO 1 — 3A commits a binary; nothing else in the repo can regenerate it
+  - Files: `tools/make-icon.ps1`, `ClaudeBG.ico`
+  - Verify: regenerating produces a byte-identical file; eyeball the 16px frame
+- [ ] **T6 (P2, human: ~40min / CC: ~8min)** — ClaudeBG.ps1 — Add `-InstallShortcut` / `-RemoveShortcut`; wire into `Invoke-Patch` and `Invoke-Restore`
+  - Surfaced by: Architecture, Issue 3 — no `IconLocation`; the exe carries its own icon
+  - Files: `ClaudeBG.ps1`
+  - Verify: Windows Search finds "ClaudeBG" (indexing can lag a few seconds on first write)
+- [ ] **T7 (P2, human: ~1h / CC: ~12min)** — tray — Rewire both startup paths; delete `MakeIcon` and the `DestroyIcon` P/Invoke
+  - Surfaced by: Architecture, Issues 2 and 3 — second instance uses `-NoHeal`; icon comes from the exe
+  - Files: `tray/ClaudeBGTray.cs`
+  - Verify: rebuild with `csc … /win32icon:ClaudeBG.ico`; launch twice, confirm no dialog and no second tray icon
+- [ ] **T8 (P2, human: ~50min / CC: ~10min)** — ClaudeBG.ps1 — Rework `-Status`: patch state, staleness, shortcut target compare, fuse probe behind `-Deep`
+  - Surfaced by: Code quality Issue 5, Performance Issue 7, TODO 2
+  - Files: `ClaudeBG.ps1`
+  - Verify: plain `-Status` returns instantly with no Node on PATH
+- [ ] **T9 (P1, human: ~4h / CC: ~25min)** — tests — Pester suite `ClaudeBG.Tests.ps1`
+  - Surfaced by: Test review, Issue 6 — 0/31 paths covered; two CRITICAL and silent
+  - Files: `ClaudeBG.Tests.ps1`
+  - Verify: `Invoke-Pester` green, including both CRITICAL cases
+- [ ] **T10 (P3, human: ~20min / CC: ~4min)** — docs — Update `README.md:131` (day-to-day use) and `:278` (file table)
+  - Surfaced by: Distribution check — new artifacts and a new way to launch
+  - Files: `README.md`
+  - Verify: a fresh reader can install and reach the Start Menu entry from the README alone
+
+Build order: T1 → T2 → T3 → T4 → T9 (tests alongside, not after) → T5 → T6 → T7 → T8 → T10.
+T1 first because nothing is testable until it lands.
 
 ## What I noticed about how you think
 
@@ -221,3 +440,37 @@ Start Menu entry in the "Day-to-day use" section (`README.md:131`) and adding
 - `tray/ClaudeBGTray.cs:7` says **"All the real work lives in ClaudeBG.ps1."** You
   wrote that boundary down a session ago, and it's what made Approach C the
   obvious answer today. Architecture notes you write to yourself pay out later.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 8 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+Findings by section: Architecture 3 (2 P1), Code Quality 2, Test 1 (P1),
+Performance 1, Deferred-question 1. All 8 resolved and folded into the plan.
+Two TODOs raised, both pulled into this change rather than deferred, so no
+`TODOS.md` was created.
+
+The two P1s were found by reading `ClaudeBG.ps1` rather than by reasoning about
+the plan: `Invoke-Restore` (`:463-473`) never deletes the `.orig` backups the
+plan's patch-detection depended on, and an unguarded `Invoke-Patch` inside
+`-Launch` would abort on `Assert-Node` (`:143`, with `$ErrorActionPreference` set
+to `Stop` at `:63`) and never open Claude — making the plan's own Success
+Criterion 5 unreachable.
+
+Test coverage went from 0/31 paths with no test infrastructure in the repo to an
+agreed Pester suite, gated behind two structural changes (`:501-508` switch guard,
+pure `Get-LaunchPlan`) that are good design independently.
+
+Net scope change: the plan got **smaller**. Build-time `/win32icon` removed all
+runtime ICO-container code and deletes `MakeIcon`, the `DestroyIcon` P/Invoke,
+and its HICON leak handling.
+
+**VERDICT:** ENG CLEARED — ready to implement.
+
+NO UNRESOLVED DECISIONS
