@@ -1,0 +1,10 @@
+# Local working artefacts, not part of the project
+*.userbackup
+domdump.json
+status.log
+tools/
+
+# Screenshots from the investigation. Kept locally, never committed: they show
+# the Claude sidebar in full, which means real conversation titles and account
+# name. Nothing in the project depends on them.
+spike/

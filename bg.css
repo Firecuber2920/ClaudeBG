@@ -1,0 +1,149 @@
+/* ClaudeBG - art direction.
+ *
+ * Installed to %APPDATA%\ClaudeBG\bg.css and read at page load, so edits apply
+ * with Ctrl+R in Claude Desktop - no repack, no restart. The patch supplies:
+ *
+ *   --claudebg-img      url("data:image/png;base64,...") of your image
+ *   --claudebg-opacity  0..1 from the tray / -SetOpacity
+ *   --claudebg-scrim    1 - opacity, precomputed
+ *
+ * THE IDEA. The old build painted the image ON TOP of the whole app, so at 65%
+ * every glyph was only 35% of itself. Nothing could be raised back above it:
+ * html::after sits in the root stacking context, and .dframe-sidebar /
+ * .dframe-content both set `isolation: isolate`, which traps any z-index set
+ * inside them. So the image goes BEHIND instead, and the surfaces you actually
+ * read from are brought back up as defined, frosted panels.
+ *
+ *   canvas ........ the image, full strength
+ *   html::before .. scrim, opacity = 1 - --claudebg-opacity
+ *   main .......... transparent, so the image reads through the empty chat area
+ *   aside, composer frosted panels, above the image, legible
+ */
+
+/* ---- Layer 0: the image, on the canvas, behind everything ---------------- */
+html {
+  background-image: var(--claudebg-img);
+  background-size: cover;
+  background-position: center center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+/* ---- Layer 1: the scrim -------------------------------------------------- */
+/* "65% opacity" now means 65% image / 35% Claude's own surface colour, which is
+ * the same perceived strength as the old overlay - but laid UNDER the UI. */
+html::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--cds-surface-1, #151515);
+  opacity: var(--claudebg-scrim, 0.35);
+}
+
+/* ---- Layer 2: stop the app painting over the image ----------------------- */
+/* Two full-viewport opaque layers stand between the image and the user:
+ *
+ *   main.dframe-content                          opaque #151515
+ *   div.pointer-events-none.absolute.inset-0     opaque #151515 + grid lines
+ *
+ * The second one is easy to miss: -Probe caught it at `opacity: 0` because it
+ * was still mid boot-fade, so it looks harmless in the dump and then settles
+ * opaque over everything. Only its background-COLOR is cleared - its
+ * background-image is Claude's faint grid, which is worth keeping over a photo.
+ */
+body,
+main.dframe-content,
+div.pointer-events-none.absolute.inset-0.bg-surface-1 {
+  background-color: transparent !important;
+}
+
+/* ---- Layer 2b: the reading band ------------------------------------------ */
+/* The sidebar and the composer are real elements you can style. The things you
+ * READ in the middle - the greeting, and every message in a conversation - are
+ * not: they are bare text on whatever is behind them, and claude.ai's markup
+ * for them is Tailwind hashes that will not survive a redeploy. So instead of
+ * chasing per-message selectors, the centre column gets one soft scrim behind
+ * ALL of it, on main's own pseudo-element.
+ *
+ * Two constraints found by testing, both worth knowing before editing this:
+ *   - ::after does not render anywhere in this app; ::before does. Use ::before.
+ *   - mask-image does NOT clip an element that has backdrop-filter, so the soft
+ *     edges come from gradients (which fade natively) rather than a mask.
+ *
+ * z-index:-1 puts it under main's content but still above the canvas image.
+ */
+main.dframe-content::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(to right,
+      rgba(16, 16, 16, 0)    0%,
+      rgba(16, 16, 16, 0.58) 20%,
+      rgba(16, 16, 16, 0.58) 80%,
+      rgba(16, 16, 16, 0)  100%),
+    linear-gradient(to bottom,
+      rgba(16, 16, 16, 0)    35%,
+      rgba(16, 16, 16, 0.30) 100%);
+
+  /* Deliberately NO backdrop-filter here. A blur is the strongest readability
+   * tool available, but this band spans the whole chat area, so any blur
+   * applies to the whole photo - and a uniformly soft photo is no longer the
+   * bold background that was asked for. The sidebar and composer can afford
+   * blur because they are small and have defined edges; this cannot.
+   *
+   * THIS IS THE KNOB. 0.58 is the centre-column darkening: raise it toward
+   * 0.75 if long conversations feel like hard work, drop it toward 0.40 to let
+   * more of the photo through behind the text. The 20%/80% stops set how wide
+   * the calm column is. Ctrl+R applies changes; no repack. */
+}
+
+/* ---- Layer 3: the surfaces that have to stay readable -------------------- */
+/* The recipe, in order of how much each contributes:
+ *
+ *  1. backdrop-filter: blur() - by far the biggest win. Destroys the
+ *     high-frequency detail in the photo that fights letterforms, while
+ *     letting its colour through as a tint. A panel over a blurred backdrop
+ *     stays readable at image opacities that would otherwise be hopeless.
+ *  2. a near-opaque fill - keeps the text/background contrast ratio the app
+ *     was designed around. 0.82-0.90 reads as "tinted glass", not "washed out".
+ *  3. saturate() - the blur alone leaves the tint muddy; pushing saturation
+ *     back up keeps the panel feeling like it belongs to the photo.
+ *  4. a hairline top-light ring + a drop shadow - this is what makes a panel
+ *     read as a distinct plane rather than a smudge. Done with inset box-shadow
+ *     rather than `border` so it adds no layout box (the composer is
+ *     box-content; a real border would resize it).
+ */
+
+aside.dframe-sidebar {
+  background-color: rgba(17, 17, 17, 0.82) !important;
+  backdrop-filter: blur(28px) saturate(135%);
+  -webkit-backdrop-filter: blur(28px) saturate(135%);
+  box-shadow:
+    inset -1px 0 0 rgba(255, 255, 255, 0.09),
+    2px 0 32px rgba(0, 0, 0, 0.50);
+}
+
+/* The composer, and anything else on Claude's "elevated surface" token. */
+.bg-surface-3 {
+  background-color: rgba(32, 32, 31, 0.88) !important;
+  backdrop-filter: blur(26px) saturate(130%);
+  -webkit-backdrop-filter: blur(26px) saturate(130%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.10),
+    0 18px 48px -12px rgba(0, 0, 0, 0.75),
+    0 2px 8px rgba(0, 0, 0, 0.40);
+}
+
+/* Typing is the one moment the panel should stop being scenery. */
+.bg-surface-3:focus-within {
+  background-color: rgba(32, 32, 31, 0.94) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    0 22px 56px -12px rgba(0, 0, 0, 0.80),
+    0 2px 8px rgba(0, 0, 0, 0.45);
+}
